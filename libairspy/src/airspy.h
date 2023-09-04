@@ -102,6 +102,7 @@ typedef struct {
 	void* samples;
 	int sample_count;
 	uint64_t dropped_samples;
+	uint32_t dropped_packets;
 	enum airspy_sample_type sample_type;
 } airspy_transfer_t, airspy_transfer;
 
@@ -207,6 +208,9 @@ extern ADDAPI int ADDCALL airspy_set_sensitivity_gain(struct airspy_device* devi
 
 /* Parameter value shall be 0=Disable BiasT or 1=Enable BiasT */
 extern ADDAPI int ADDCALL airspy_set_rf_bias(struct airspy_device* dev, uint8_t value);
+
+/* Parameter value shall be 0=Disable seq_num or 1=Enable seq_num */
+extern ADDAPI int ADDCALL airspy_set_seq_num(struct airspy_device* device, uint8_t value);
 
 /* Parameter value shall be 0=Disable Packing or 1=Enable Packing */
 extern ADDAPI int ADDCALL airspy_set_packing(struct airspy_device* device, uint8_t value);

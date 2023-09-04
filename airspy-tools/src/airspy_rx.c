@@ -108,6 +108,7 @@ int gettimeofday(struct timeval *tv, void* ignored)
 #define DEFAULT_MIXER_GAIN (5)
 
 #define PACKING_MAX (0xffffffff)
+#define SEQ_NUM_DEFAULT (0)
 
 #define FREQ_HZ_MIN (24000000ul) /* 24MHz */
 #define FREQ_HZ_MAX (1900000000ul) /* 1900MHz (officially 1750MHz) */
@@ -238,6 +239,9 @@ uint64_t bytes_to_xfer = 0;
 
 bool call_set_packing = false;
 uint32_t packing_val = 0;
+
+bool call_set_seq_num = false;
+uint32_t seq_num_val = SEQ_NUM_DEFAULT;
 
 bool sample_rate = false;
 uint32_t sample_rate_val;
@@ -447,7 +451,7 @@ int rx_callback(airspy_transfer_t* transfer)
 		}
 
 		if(pt_rx_buffer != NULL)
-		{
+		{	
 			bytes_written = fwrite(pt_rx_buffer, 1, bytes_to_write, fd);
 		}else
 		{
@@ -474,10 +478,11 @@ static void usage(void)
 	fprintf(stderr, " This is for SDR# compatibility and may not work with other software\n");
 	fprintf(stderr, "[-s serial_number_64bits]: Open device with specified 64bits serial number\n");
 	fprintf(stderr, "[-p packing]: Set packing for samples, \n");
+	fprintf(stderr, "[-q seq_num]: Set sequence number for samples, \n");
 	fprintf(stderr, " 1=enabled(12bits packed), 0=disabled(default 16bits not packed)\n");
 	fprintf(stderr, "[-f frequency_MHz]: Set frequency in MHz between [%lu, %lu] (default %luMHz)\n",
 		FREQ_HZ_MIN / FREQ_ONE_MHZ, FREQ_HZ_MAX / FREQ_ONE_MHZ, DEFAULT_FREQ_HZ / FREQ_ONE_MHZ);
-	fprintf(stderr, "[-a sample_rate]: Set sample rate\n");
+	fprintf(stderr, "[-a sample_rate]: Set sample rate, \n");
 	fprintf(stderr, "[-t sample_type]: Set sample type, \n");
 	fprintf(stderr, " 0=FLOAT32_IQ, 1=FLOAT32_REAL, 2=INT16_IQ(default), 3=INT16_REAL, 4=U16_REAL, 5=RAW\n");
 	fprintf(stderr, "[-b biast]: Set Bias Tee, 1=enabled, 0=disabled(default)\n");
@@ -532,13 +537,14 @@ int main(int argc, char** argv)
 
 	uint32_t count;
 	uint32_t packing_val_u32;
+	uint32_t seq_num_val_u32;
 	uint32_t *supported_samplerates;
 	uint32_t sample_rate_u32;
 	uint32_t sample_type_u32;
 	double freq_hz_temp;
 	char str[20];
 
-	while( (opt = getopt(argc, argv, "r:ws:p:f:a:t:b:v:m:l:g:h:n:d")) != EOF )
+	while( (opt = getopt(argc, argv, "r:ws:p:q:f:a:t:b:v:m:l:g:h:n:d")) != EOF )
 	{
 		result = AIRSPY_SUCCESS;
 		switch( opt ) 
@@ -574,6 +580,23 @@ int main(int argc, char** argv)
 					break;
 				}
 			break;
+			case 'q': /* sequence number */
+				result = parse_u32(optarg, &seq_num_val_u32);
+				switch (seq_num_val_u32)
+				{
+				case 0:
+				case 1:
+					seq_num_val = seq_num_val_u32;
+					call_set_seq_num = true;
+					break;
+
+				default:
+					/* Invalid value will display error */
+					seq_num_val = SEQ_NUM_DEFAULT;
+					call_set_seq_num = false;
+					break;
+				}
+				break;
 
 			case 'f':
 				freq = true;
@@ -816,6 +839,7 @@ int main(int argc, char** argv)
 		if(serial_number)
 			fprintf(stderr, "serial_number_64bits -s 0x%08X%08X\n", serial_number_msb_val, serial_number_lsb_val);
 		fprintf(stderr, "packing -p %d\n", packing_val);
+		fprintf(stderr, "sequence number -q %d\n", seq_num_val);
 		fprintf(stderr, "frequency_MHz -f %.6fMHz (%sHz)\n",((double)freq_hz/(double)FREQ_ONE_MHZ), u64toa(freq_hz, &ascii_u64_data1) );
 		fprintf(stderr, "sample_type -t %d\n", sample_type_val);
 		fprintf(stderr, "biast -b %d\n", biast_val);
@@ -934,6 +958,17 @@ int main(int argc, char** argv)
 		result = airspy_set_packing(device, packing_val);
 		if( result != AIRSPY_SUCCESS ) {
 			fprintf(stderr, "airspy_set_packing() failed: %s (%d)\n", airspy_error_name(result), result);
+			airspy_close(device);
+			airspy_exit();
+			return EXIT_FAILURE;
+		}
+	}
+
+	if (call_set_seq_num == true)
+	{
+		result = airspy_set_seq_num(device, seq_num_val);
+		if (result != AIRSPY_SUCCESS) {
+			fprintf(stderr, "airspy_set_seq_num() failed: %s (%d)\n", airspy_error_name(result), result);
 			airspy_close(device);
 			airspy_exit();
 			return EXIT_FAILURE;

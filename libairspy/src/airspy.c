@@ -70,6 +70,19 @@ typedef int bool;
 #define MIN_SAMPLERATE_BY_VALUE (1000000)
 #define SAMPLE_TYPE_IS_IQ(x) ((x) == AIRSPY_SAMPLE_FLOAT32_IQ || (x) == AIRSPY_SAMPLE_INT16_IQ)
 
+#define BULK_BUFF_FLAG (0xDEADBEEF)
+#define VALID_FLAG_TRASHED_BITS 1
+#define VALID_NUM_OF_FAILURES 2
+
+// Sizes are in bytes
+#define NON_PACK_PACKET_SIZE (0x4000)
+#define PADDED_PACK_PACKET_SIZE (0x2000)
+#define NON_PADDED_PACK_PACKET_SIZE (0x1800)
+#define PACK_PAD_SIZE (PADDED_PACK_PACKET_SIZE - NON_PADDED_PACK_PACKET_SIZE)
+
+#define NON_PACK_NUMBER_OF_PACKETS (16)
+#define PACK_NUMBER_OF_PACKETS (24)
+
 typedef struct {
 	uint32_t freq_hz;
 } set_freq_params_t;
@@ -90,8 +103,10 @@ typedef struct airspy_device
 	uint32_t *supported_samplerates;
 	uint32_t transfer_count;
 	uint32_t buffer_size;
+	uint32_t bulk_seq_num;
 	uint32_t dropped_buffers;
 	uint32_t dropped_buffers_queue[RAW_BUFFER_COUNT];
+	bool seq_num_enabled;
 	uint16_t *received_samples_queue[RAW_BUFFER_COUNT];
 	volatile int received_samples_queue_head;
 	volatile int received_samples_queue_tail;
@@ -158,7 +173,9 @@ static int free_transfers(airspy_device_t* device)
 				device->transfers[transfer_index] = NULL;
 			}
 		}
+
 		free(device->transfers);
+
 		device->transfers = NULL;
 
 		if (device->output_buffer != NULL)
@@ -230,12 +247,13 @@ static int allocate_transfers(airspy_device_t* const device)
 		}
 
 		device->transfers = (struct libusb_transfer**) calloc(device->transfer_count, sizeof(struct libusb_transfer));
+
 		if (device->transfers == NULL)
 		{
 			return AIRSPY_ERROR_NO_MEM;
 		}
 
-		for (transfer_index = 0; transfer_index<device->transfer_count; transfer_index++)
+		for (transfer_index = 0; transfer_index < device->transfer_count; transfer_index++)
 		{
 			device->transfers[transfer_index] = libusb_alloc_transfer(0);
 			if (device->transfers[transfer_index] == NULL)
@@ -316,25 +334,31 @@ static void convert_samples_float(uint16_t *src, float *dest, int count)
 	}
 }
 
-static inline void unpack_samples(uint32_t *input, uint16_t *output, int length)
+static inline void unpack_samples(uint32_t *input, uint16_t *output, int length, bool padded)
 {
-	int i, j;
+	int i, j, k;
 
-	for (i = 0, j = 0; j < length; i += 3, j += 8)
+	for (i = 0, j = 0, k = 0; j < length; i += 3, j += 8)
 	{
-		output[j + 0] = (input[i] >> 20) & 0xfff;
-		output[j + 1] = (input[i] >> 8) & 0xfff;
-		output[j + 2] = ((input[i] & 0xff) << 4) | ((input[i + 1] >> 28) & 0xf);
-		output[j + 3] = ((input[i + 1] & 0xfff0000) >> 16);
-		output[j + 4] = ((input[i + 1] & 0xfff0) >> 4);
-		output[j + 5] = ((input[i + 1] & 0xf) << 8) | ((input[i + 2] & 0xff000000) >> 24);
-		output[j + 6] = ((input[i + 2] >> 12) & 0xfff);
-		output[j + 7] = ((input[i + 2] & 0xfff));
+		if (padded && (i % NON_PADDED_PACK_PACKET_SIZE == 0)) // Passing the header (sequence number + flag + padding)
+		{
+			k += PACK_PAD_SIZE;
+		}
+
+		output[j + 0] = (input[(i + k)] >> 20) & 0xfff;
+		output[j + 1] = (input[(i + k)] >> 8) & 0xfff;
+		output[j + 2] = ((input[(i + k)] & 0xff) << 4) | ((input[(i + k) + 1] >> 28) & 0xf);
+		output[j + 3] = ((input[(i + k) + 1] & 0xfff0000) >> 16);
+		output[j + 4] = ((input[(i + k) + 1] & 0xfff0) >> 4);
+		output[j + 5] = ((input[(i + k) + 1] & 0xf) << 8) | ((input[(i + k) + 2] & 0xff000000) >> 24);
+		output[j + 6] = ((input[(i + k) + 2] >> 12) & 0xfff);
+		output[j + 7] = ((input[(i + k) + 2] & 0xfff));
 	}
 }
 
 static void* consumer_threadproc(void *arg)
 {
+	bool are_packets_missing = false;
 	int sample_count;
 	uint16_t* input_samples;
 	uint32_t dropped_buffers;
@@ -368,12 +392,12 @@ static void* consumer_threadproc(void *arg)
 
 		if (device->packing_enabled)
 		{
-			sample_count = ((device->buffer_size / 2) * 4) / 3;
+			sample_count = (device->seq_num_enabled ? device->buffer_size - (PACK_PAD_SIZE * PACK_NUMBER_OF_PACKETS) : device->buffer_size);
+			sample_count = ((sample_count / 2) * 4) / 3;
 
 			if (device->sample_type != AIRSPY_SAMPLE_RAW)
 			{
-				unpack_samples((uint32_t*)input_samples, device->unpacked_samples, sample_count);
-
+				unpack_samples((uint32_t*)input_samples, device->unpacked_samples, sample_count, device->seq_num_enabled);
 				input_samples = device->unpacked_samples;
 			}
 		}
@@ -422,7 +446,13 @@ static void* consumer_threadproc(void *arg)
 		transfer.ctx = device->ctx;
 		transfer.sample_count = sample_count;
 		transfer.sample_type = device->sample_type;
-		transfer.dropped_samples = (uint64_t) dropped_buffers * (uint64_t) sample_count;
+		transfer.dropped_packets = dropped_buffers;
+
+		uint64_t sample_count_per_packet = device->packing_enabled ? 
+											(sample_count / PACK_NUMBER_OF_PACKETS) : 
+											(sample_count / NON_PACK_NUMBER_OF_PACKETS);
+
+		transfer.dropped_samples = (uint64_t) (dropped_buffers) * sample_count_per_packet;
 
 		if (device->callback(&transfer) != 0)
 		{
@@ -440,6 +470,18 @@ static void* consumer_threadproc(void *arg)
 	return NULL;
 }
 
+static size_t popcount(uint32_t integer) {
+	size_t count = 0;
+
+	while (integer != 0)
+	{
+		count += (integer & 0x1) ? 1 : 0;
+		integer >>= 1;
+	}
+
+	return count;
+}
+
 static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer)
 {
 	uint16_t *temp;
@@ -452,14 +494,130 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 
 	if (usb_transfer->status == LIBUSB_TRANSFER_COMPLETED && usb_transfer->actual_length == usb_transfer->length)
 	{
+		uint32_t seq_num, flag, num_of_failures = 0, missed_packets = 0;
+		bool drop_packets = false;
+
+		if (device->seq_num_enabled)
+		{
+			// Retrieving the seq_num
+			if (device->packing_enabled)
+			{
+				uint32_t* dword_buff_ptr = NULL;
+
+				for (size_t i = 0; i < PACK_NUMBER_OF_PACKETS; i++)
+				{
+					dword_buff_ptr = (uint32_t*)usb_transfer->buffer;
+					seq_num = dword_buff_ptr[i * (PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + (NON_PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr))];
+					flag = dword_buff_ptr[i * (PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + (NON_PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + 1];
+
+					if (popcount(flag ^ BULK_BUFF_FLAG) > VALID_FLAG_TRASHED_BITS) // The received packet is trashed
+					{
+						memset(&(usb_transfer->buffer)[PADDED_PACK_PACKET_SIZE * i], 0, PADDED_PACK_PACKET_SIZE);
+						++device->bulk_seq_num;
+					}
+					else // Checking for seq_num jumps
+					{
+						if (++device->bulk_seq_num != seq_num)
+						{
+							num_of_failures++;
+							
+							if (num_of_failures > VALID_NUM_OF_FAILURES)
+							{
+								if (device->bulk_seq_num < seq_num) // If somehow the sequence number moved backwards, it is wierd and we do nothing
+								{
+									if (i != VALID_NUM_OF_FAILURES)
+									{
+										drop_packets = true;
+										missed_packets = (seq_num - device->bulk_seq_num) + PACK_NUMBER_OF_PACKETS;
+										device->bulk_seq_num = seq_num;
+										break;
+									}
+									else
+									{
+										missed_packets = (seq_num - device->bulk_seq_num);
+									}
+								}
+
+								device->bulk_seq_num = seq_num;
+								num_of_failures = 0;
+							}
+						}
+						else
+						{
+							num_of_failures = 0;
+						}
+					}
+				}
+			}
+			else
+			{
+				for (size_t i = 0; i < NON_PACK_NUMBER_OF_PACKETS; i++)
+				{
+					flag = 0;
+					seq_num = 0;
+					for (int j = 7; j >= 0; j--) // Reading seq_num
+					{
+						seq_num <<= 4;
+						seq_num |= ((usb_transfer->buffer[NON_PACK_PACKET_SIZE * i + (j * 2 + 1)] & 0xF0) >> 4);
+						usb_transfer->buffer[NON_PACK_PACKET_SIZE * i + (j * 2 + 1)] &= 0x0F;
+					}
+
+					for (int j = 8; j < 16; j++) // Reading flag
+					{
+						flag <<= 4;
+						flag |= ((usb_transfer->buffer[NON_PACK_PACKET_SIZE * i + (j * 2 + 1)] & 0xF0) >> 4);
+						usb_transfer->buffer[NON_PACK_PACKET_SIZE * i + (j * 2 + 1)] &= 0x0F;
+					}
+
+					if (popcount(flag ^ BULK_BUFF_FLAG) > VALID_FLAG_TRASHED_BITS) // The received packet is trashed
+					{
+						memset(&(usb_transfer->buffer)[NON_PACK_PACKET_SIZE * i], 0, NON_PACK_PACKET_SIZE);
+						++device->bulk_seq_num;
+					}
+					else // Checking for seq_num jumps
+					{
+						if (++device->bulk_seq_num != seq_num)
+						{
+							num_of_failures++;
+							if (num_of_failures > VALID_NUM_OF_FAILURES)
+							{
+								if (device->bulk_seq_num < seq_num)
+								{
+									if (i != VALID_NUM_OF_FAILURES) 
+									{
+										drop_packets = true;
+										missed_packets = (seq_num - device->bulk_seq_num) + NON_PACK_NUMBER_OF_PACKETS;
+										device->bulk_seq_num = seq_num;
+										break;
+									}
+									else 
+									{
+										missed_packets = (seq_num - device->bulk_seq_num);
+									}
+								}
+
+								device->bulk_seq_num = seq_num;
+								num_of_failures = 0;
+							}
+						}
+						else
+						{
+							num_of_failures = 0;
+						}
+					}
+				}
+			}
+		}
+
 		pthread_mutex_lock(&device->consumer_mp);
 
-		if (device->received_buffer_count < RAW_BUFFER_COUNT)
+		if (device->received_buffer_count < RAW_BUFFER_COUNT && !drop_packets)
 		{
 			temp = device->received_samples_queue[device->received_samples_queue_head];
 			device->received_samples_queue[device->received_samples_queue_head] = (uint16_t *)usb_transfer->buffer;
 			usb_transfer->buffer = (uint8_t *)temp;
 
+			device->dropped_buffers += missed_packets;
 			device->dropped_buffers_queue[device->received_samples_queue_head] = device->dropped_buffers;
 			device->dropped_buffers = 0;
 			
@@ -468,9 +626,13 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 
 			pthread_cond_signal(&device->consumer_cv);
 		}
+		else if (missed_packets != 0)
+		{
+			device->dropped_buffers += missed_packets;
+		}
 		else
 		{
-			device->dropped_buffers++;
+			device->dropped_buffers += (device->packing_enabled ? PACK_NUMBER_OF_PACKETS : NON_PACK_NUMBER_OF_PACKETS);
 		}
 
 		pthread_mutex_unlock(&device->consumer_mp);
@@ -870,7 +1032,8 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number, in
 	lib_device->transfers = NULL;
 	lib_device->callback = NULL;
 	lib_device->transfer_count = 16;
-	lib_device->buffer_size = 262144;
+	lib_device->buffer_size = NON_PACK_PACKET_SIZE * NON_PACK_NUMBER_OF_PACKETS;
+	lib_device->seq_num_enabled = false;
 	lib_device->packing_enabled = false;
 	lib_device->streaming = false;
 	lib_device->stop_requested = false;
@@ -1895,6 +2058,57 @@ int airspy_list_devices(uint64_t *serials, int count)
 		return airspy_gpio_write(device, GPIO_PORT1, GPIO_PIN13, value);
 	}
 
+	int ADDCALL airspy_set_seq_num(airspy_device_t* device, uint8_t value)
+	{
+		int result;
+		uint8_t retval;
+
+		if (device->streaming)
+		{
+			return AIRSPY_ERROR_BUSY;
+		}
+
+		result = libusb_control_transfer(
+			device->usb_device,
+			LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+			AIRSPY_SET_SEQ_NUM,
+			0,
+			value,
+			&retval,
+			1,
+			0);
+
+		if (result < 1)
+		{
+			return  AIRSPY_ERROR_LIBUSB;
+		}
+
+		if (device->packing_enabled && ((bool)value != device->seq_num_enabled))
+		{
+			cancel_transfers(device);
+			free_transfers(device);
+
+			if ((bool)value)
+			{
+				device->buffer_size = (PADDED_PACK_PACKET_SIZE * PACK_NUMBER_OF_PACKETS);
+			}
+			else
+			{
+				device->buffer_size = (NON_PADDED_PACK_PACKET_SIZE * PACK_NUMBER_OF_PACKETS);
+			}
+
+			result = allocate_transfers(device);
+			if (result != 0)
+			{
+				return AIRSPY_ERROR_NO_MEM;
+			}
+		}
+
+		device->seq_num_enabled = (bool)value;
+
+		return AIRSPY_SUCCESS;
+	}
+
 	int ADDCALL airspy_set_packing(airspy_device_t* device, uint8_t value)
 	{
 		int result;
@@ -1928,7 +2142,22 @@ int airspy_list_devices(uint64_t *serials, int count)
 			free_transfers(device);
 
 			device->packing_enabled = packing_enabled;
-			device->buffer_size = packing_enabled ? (6144 * 24) : 262144;
+
+			if (packing_enabled) 
+			{
+				if (device->seq_num_enabled) 
+				{
+					device->buffer_size = (PADDED_PACK_PACKET_SIZE * PACK_NUMBER_OF_PACKETS);
+				} 
+				else
+				{
+					device->buffer_size = (NON_PADDED_PACK_PACKET_SIZE * PACK_NUMBER_OF_PACKETS);
+				}
+			}
+			else 
+			{
+				device->buffer_size = (NON_PACK_PACKET_SIZE * PACK_NUMBER_OF_PACKETS);
+			}
 
 			result = allocate_transfers(device);
 			if (result != 0)
