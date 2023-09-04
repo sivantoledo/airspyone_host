@@ -340,9 +340,9 @@ static inline void unpack_samples(uint32_t *input, uint16_t *output, int length,
 
 	for (i = 0, j = 0, k = 0; j < length; i += 3, j += 8)
 	{
-		if (padded && (i % NON_PADDED_PACK_PACKET_SIZE == 0)) // Passing the header (sequence number + flag + padding)
+		if (padded && i != 0 && (i % (NON_PADDED_PACK_PACKET_SIZE / sizeof(sizeof(*input))) == 0)) // Passing the header (sequence number + flag + padding)
 		{
-			k += PACK_PAD_SIZE;
+			k += (PACK_PAD_SIZE / sizeof(*input));
 		}
 
 		output[j + 0] = (input[(i + k)] >> 20) & 0xfff;
