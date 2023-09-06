@@ -1046,7 +1046,7 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number, in
 	lib_device->callback = NULL;
 	lib_device->transfer_count = 16;
 	lib_device->buffer_size = NON_PACK_PACKET_SIZE * NON_PACK_NUMBER_OF_PACKETS;
-	lib_device->first_packet = false;
+	lib_device->first_packet = true;
 	lib_device->seq_num_enabled = false;
 	lib_device->packing_enabled = false;
 	lib_device->streaming = false;
