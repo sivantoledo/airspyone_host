@@ -106,6 +106,7 @@ typedef struct airspy_device
 	uint32_t bulk_seq_num;
 	uint32_t dropped_buffers;
 	uint32_t dropped_buffers_queue[RAW_BUFFER_COUNT];
+	bool first_packet;
 	bool seq_num_enabled;
 	uint16_t *received_samples_queue[RAW_BUFFER_COUNT];
 	volatile int received_samples_queue_head;
@@ -340,7 +341,7 @@ static inline void unpack_samples(uint32_t *input, uint16_t *output, int length,
 
 	for (i = 0, j = 0, k = 0; j < length; i += 3, j += 8)
 	{
-		if (padded && i != 0 && (i % (NON_PADDED_PACK_PACKET_SIZE / sizeof(sizeof(*input))) == 0)) // Passing the header (sequence number + flag + padding)
+		if (padded && i != 0 && (i % (NON_PADDED_PACK_PACKET_SIZE / sizeof(*input)) == 0)) // Passing the header (sequence number + flag + padding)
 		{
 			k += (PACK_PAD_SIZE / sizeof(*input));
 		}
@@ -392,7 +393,7 @@ static void* consumer_threadproc(void *arg)
 
 		if (device->packing_enabled)
 		{
-			sample_count = (device->seq_num_enabled ? device->buffer_size - (PACK_PAD_SIZE * PACK_NUMBER_OF_PACKETS) : device->buffer_size);
+			sample_count = NON_PADDED_PACK_PACKET_SIZE * PACK_NUMBER_OF_PACKETS;
 			sample_count = ((sample_count / 2) * 4) / 3;
 
 			if (device->sample_type != AIRSPY_SAMPLE_RAW)
@@ -519,11 +520,17 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 					{
 						if (++device->bulk_seq_num != seq_num)
 						{
+							if (device->first_packet) {
+								device->first_packet = false;
+								device->bulk_seq_num = seq_num;
+								continue;
+							}
+
 							num_of_failures++;
-							
+
 							if (num_of_failures > VALID_NUM_OF_FAILURES)
 							{
-								if (device->bulk_seq_num < seq_num) // If somehow the sequence number moved backwards, it is wierd and we do nothing
+								if (device->bulk_seq_num < seq_num) // If somehow the sequence number moved backwards, it is *probably* a cause of seq_num of first packet being trashed (should be very rare)
 								{
 									if (i != VALID_NUM_OF_FAILURES)
 									{
@@ -578,19 +585,25 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 					{
 						if (++device->bulk_seq_num != seq_num)
 						{
+							if (device->first_packet) {
+								device->first_packet = false;
+								device->bulk_seq_num = seq_num;
+								continue;
+							}
+
 							num_of_failures++;
 							if (num_of_failures > VALID_NUM_OF_FAILURES)
 							{
-								if (device->bulk_seq_num < seq_num)
+								if (device->bulk_seq_num < seq_num) // If somehow the sequence number moved backwards, it is *probably* a cause of seq_num of first packet being trashed (should be very rare)
 								{
-									if (i != VALID_NUM_OF_FAILURES) 
+									if (i != VALID_NUM_OF_FAILURES)
 									{
 										drop_packets = true;
 										missed_packets = (seq_num - device->bulk_seq_num) + NON_PACK_NUMBER_OF_PACKETS;
 										device->bulk_seq_num = seq_num;
 										break;
 									}
-									else 
+									else
 									{
 										missed_packets = (seq_num - device->bulk_seq_num);
 									}
@@ -1033,6 +1046,7 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number, in
 	lib_device->callback = NULL;
 	lib_device->transfer_count = 16;
 	lib_device->buffer_size = NON_PACK_PACKET_SIZE * NON_PACK_NUMBER_OF_PACKETS;
+	lib_device->first_packet = false;
 	lib_device->seq_num_enabled = false;
 	lib_device->packing_enabled = false;
 	lib_device->streaming = false;
