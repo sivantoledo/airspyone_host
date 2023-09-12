@@ -513,7 +513,7 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 
 					if (popcount(flag ^ BULK_BUFF_FLAG) > VALID_FLAG_TRASHED_BITS) // The received packet is trashed
 					{
-						memset(&(usb_transfer->buffer)[PADDED_PACK_PACKET_SIZE * i], 0, PADDED_PACK_PACKET_SIZE);
+						//memset(&(usb_transfer->buffer)[PADDED_PACK_PACKET_SIZE * i], 0, PADDED_PACK_PACKET_SIZE);
 						++device->bulk_seq_num;
 					}
 					else // Checking for seq_num jumps
@@ -578,7 +578,7 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 
 					if (popcount(flag ^ BULK_BUFF_FLAG) > VALID_FLAG_TRASHED_BITS) // The received packet is trashed
 					{
-						memset(&(usb_transfer->buffer)[NON_PACK_PACKET_SIZE * i], 0, NON_PACK_PACKET_SIZE);
+						//memset(&(usb_transfer->buffer)[NON_PACK_PACKET_SIZE * i], 0, NON_PACK_PACKET_SIZE);
 						++device->bulk_seq_num;
 					}
 					else // Checking for seq_num jumps
