@@ -71,7 +71,7 @@ typedef int bool;
 #define SAMPLE_TYPE_IS_IQ(x) ((x) == AIRSPY_SAMPLE_FLOAT32_IQ || (x) == AIRSPY_SAMPLE_INT16_IQ)
 
 #define BULK_BUFF_FLAG (0xDEADBEEF)
-#define VALID_FLAG_TRASHED_BITS 1
+#define VALID_FLAG_TRASHED_BITS 0
 #define VALID_NUM_OF_FAILURES 2
 
 // Sizes are in bytes
@@ -508,15 +508,23 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 				for (size_t i = 0; i < PACK_NUMBER_OF_PACKETS; i++)
 				{
 					dword_buff_ptr = (uint32_t*)usb_transfer->buffer;
-					seq_num = dword_buff_ptr[i * (PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + (NON_PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr))];
-					flag = dword_buff_ptr[i * (PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + (NON_PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + 1];
 
+					// if the flag is corrupt, we ignore this packet completely.
+					flag = dword_buff_ptr[i * (PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + (NON_PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + 1];
+					if (popcount(flag ^ BULK_BUFF_FLAG) > VALID_FLAG_TRASHED_BITS) // The received packet is trashed
+					{
+						continue;
+					}
+
+					seq_num = dword_buff_ptr[i * (PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr)) + (NON_PADDED_PACK_PACKET_SIZE / sizeof(*dword_buff_ptr))];
+/*
 					if (popcount(flag ^ BULK_BUFF_FLAG) > VALID_FLAG_TRASHED_BITS) // The received packet is trashed
 					{
 						//memset(&(usb_transfer->buffer)[PADDED_PACK_PACKET_SIZE * i], 0, PADDED_PACK_PACKET_SIZE);
 						++device->bulk_seq_num;
 					}
 					else // Checking for seq_num jumps
+*/
 					{
 						if (++device->bulk_seq_num != seq_num)
 						{
